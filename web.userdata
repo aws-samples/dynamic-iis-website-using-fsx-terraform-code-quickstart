@@ -1,0 +1,5 @@
+<powershell>
+Install-WindowsFeature -name Web-Server -IncludeManagementTools
+$id = (Invoke-WebRequest -Uri  http://169.254.169.254/latest/meta-data/instance-id -UseBasicParsing).content
+Start-SSMAutomationExecution -DocumentName ${ssm_web_server_configs} -Parameters @{"InstanceId"=$id}
+</powershell>

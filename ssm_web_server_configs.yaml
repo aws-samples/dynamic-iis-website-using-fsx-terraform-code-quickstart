@@ -1,0 +1,170 @@
+description: desc
+schemaVersion: '0.3'
+assumeRole: '{{automationAssumeRole}}'
+parameters:
+  automationAssumeRole:
+    type: String
+    default: "${automationAssumeRole}"
+  InstanceId:
+    type: String
+  HostnamePrefix:
+    type: String
+    default: "${HostnamePrefix}"
+  FsxDnsName:
+    type: String
+    default: "${FsxDnsName}"
+  WebSitePath:
+    type: String
+    default: "${WebSitePath}"
+  WebSiteName:
+    type: String
+    default: "${WebSiteName}"
+  WebSitePort:
+    type: String
+    default: "${WebSitePort}"
+  IndexWebFile:
+    type: String
+    default: "${IndexWebFile}"
+  HtmlContent:
+    type: String
+    default: "${HtmlContent}"
+  DefaultWebSiteName:
+    type: String
+    default: "${DefaultWebSiteName}"  
+  DomainJoinCredentialSecretName:
+    type: String
+    default: "${DomainJoinCredentialSecretName}"
+  CloudWatchLogGroupName:
+    type: String
+    default: "${CloudWatchLogGroupName}"
+
+mainSteps:
+  - name: 'JoinDomain'
+    action: aws:runCommand
+    timeoutSeconds: 900
+    maxAttempts: 3
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{InstanceId}}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudWatchLogGroupName}}'
+      Parameters:
+        commands:
+          - |
+            $ErrorActionPreference = 'Stop'
+
+            try {
+              $CurrentComputerName = (Get-WmiObject -Class Win32_ComputerSystem).Name
+              $hostnamePrefix = '{{HostnamePrefix}}'
+              $instance_id = '{{InstanceId}}'
+              $instance_id = $instance_id.replace("i-","")
+              $trimmedInstanceId = $instance_id.Substring(0,7)
+              $newHostname = "$hostnamePrefix-$trimmedInstanceId"
+
+              if(!($CurrentComputerName.ToUpper() -eq $newHostname.ToUpper())) {
+                  Write-Host "Current computer name $CurrentComputerName is not the same as $newHostname. Will rename"
+                  Rename-Computer -NewName $newHostname -Force
+                  exit 3010
+              } else {
+                Write-Host "Current computer name $CurrentComputerName is the same as $newHostname. Will skip rename"
+              }
+
+              $PartOfDomain = (Get-WmiObject -Class Win32_ComputerSystem).PartOfDomain
+              $DomainName = (Get-WmiObject -Class Win32_ComputerSystem).Domain
+              Write-Host "Current domain name: $DomainName"
+
+              if($PartOfDomain -eq $false) {
+                Write-Host "Not joined to domain. Will attempt to join"
+
+                $domainJoinCredentialSecretName = '{{DomainJoinCredentialSecretName}}'
+              
+                $Response = Get-SECSecretValue -SecretId $domainJoinCredentialSecretName
+                $Creds = $Response.SecretString | ConvertFrom-Json
+
+                if((!$Creds.domain) -or (!$Creds.username) -or (!$Creds.password)) {
+                  throw "domain, username and/or password not found in Secret Manager secret. Ensure that Secret Values are configured properly"
+                } else {
+                  Write-Host "domain, username and password found in Secret Manager secret"
+                }
+
+                $Domain = $Creds.domain
+                
+                Write-Host "Computer Domain is: $Domain"
+                Write-Host "User domain is: $Domain"
+
+                $username = $Domain + '\' + $Creds.username
+                $password = ConvertTo-SecureString -String $($Creds.password) -AsPlainText -Force
+                $credential = New-Object System.Management.Automation.PSCredential($username, $password)
+
+                if($Creds.ou) {
+                  $OU = $Creds.ou
+                  Write-Host "Organizational Unit (OU) is: $OU"
+                  Add-Computer -DomainName $Domain -OUPath $OU -Credential $credential
+                } else {
+                  Write-Host "No Organizational Unit (OU) is specified"
+                  Add-Computer -DomainName $Domain -Credential $credential
+                }
+                
+                Write-Host "Going to restart"
+                exit 3010
+              } else {
+                Write-Output "Already part of domain $DomainName . Will skip join domain"
+              }
+              
+              Write-Output "Domain Join succeeded"
+
+            } catch [Exception] {
+                  Write-Host $_.Exception.ToString()
+                  Write-Host 'Command execution failed.'
+                  $host.SetShouldExit(1)
+            }
+
+  - name: 'ConfigureIIS'
+    action: aws:runCommand
+    timeoutSeconds: 900
+    maxAttempts: 2
+    inputs:
+      DocumentName: AWS-RunPowerShellScript
+      InstanceIds:
+        - '{{InstanceId}}'
+      CloudWatchOutputConfig:
+        CloudWatchOutputEnabled: 'true'
+        CloudWatchLogGroupName: '{{CloudWatchLogGroupName}}'
+      Parameters:
+        commands:
+          - |
+            $ErrorActionPreference = 'Stop'
+            Import-Module WebAdministration
+            try {
+                Write-Host 'Configuring {{WebSiteName}} on the FSX share'
+                $domainJoinCredentialSecretName = '{{DomainJoinCredentialSecretName}}'
+                $Response = Get-SECSecretValue -SecretId $domainJoinCredentialSecretName
+                $Creds = $Response.SecretString | ConvertFrom-Json
+                $Domain = $Creds.domain
+                $username = $Domain + '\' + $Creds.username
+                Write-Host "User Name: $username"
+
+                Write-Host "Copying sample image to FSx"
+                Copy-Item "C:\inetpub\wwwroot\iisstart.png" -Destination "\\{{FsxDnsName}}\{{WebSitePath}}\iisstart.png"
+
+                Write-Host "Create html file {{IndexWebFile}} under \\{{FsxDnsName}}\{{WebSitePath}}"
+                Write-Host "HTML File content: {{HtmlContent}}"
+                New-Item -Path "\\{{FsxDnsName}}\{{WebSitePath}}" -Name "{{IndexWebFile}}" -ItemType "file" -Value "{{HtmlContent}}" -Force
+
+                Write-Host "Remove default website {{DefaultWebSiteName}}"
+                Remove-WebSite -Name "{{DefaultWebSiteName}}"
+
+                Write-Host "Create new website - Name:{{WebSiteName}} Port:{{WebSitePort}} PhysicalPath:\\{{FsxDnsName}}\{{WebSitePath}}"
+                New-WebSite -Name "{{WebSiteName}}" -Port "{{WebSitePort}}" -PhysicalPath "\\{{FsxDnsName}}\{{WebSitePath}}"
+
+                Write-Host "Set credentials to connect to FSx (User:$username)"
+                Set-WebConfigurationProperty "system.applicationHost/sites/site[@name='{{WebSiteName}}']/application[@path='/']/virtualDirectory[@path='/']" -name 'username' -value $username
+                Set-WebConfigurationProperty "system.applicationHost/sites/site[@name='{{WebSiteName}}']/application[@path='/']/virtualDirectory[@path='/']" -name 'password' -value $Creds.password
+                Write-Output "IIS Configuration complete"
+            } catch [Exception] {
+                  Write-Host $_.Exception.ToString()
+                  Write-Host 'Command execution failed.'
+                  $host.SetShouldExit(1)
+            }
